@@ -3,7 +3,7 @@ import PyPDF2
 from docx import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_ollama import OllamaEmbeddings
-from langchain_community.vectorstores import Chroma
+from langchain_community.vectorstores import FAISS
 from langchain.chains import ConversationalRetrievalChain
 from langchain_ollama import OllamaLLM
 from langchain.memory import ConversationBufferMemory
@@ -45,7 +45,7 @@ def load_documents_from_folder(folder_path):
     documents = []
     if not os.path.exists(folder_path):
         return documents
-    
+
     for filename in os.listdir(folder_path):
         file_path = os.path.join(folder_path, filename)
         if os.path.isfile(file_path):
@@ -68,37 +68,38 @@ def split_text(text, chunk_size=1000, chunk_overlap=200):
     chunks = splitter.split_text(text)
     return chunks
 
-def create_vector_db(documents, persist_directory="./chroma_db"):
+def create_vector_db(documents, persist_directory="./faiss_db"):
     all_chunks = []
     for doc in documents:
         chunks = split_text(doc["content"])
         all_chunks.extend(chunks)
-    
+
     if not all_chunks:
         raise ValueError("No text chunks to process")
-    
+
     embeddings = OllamaEmbeddings(model="nomic-embed-text")
-    vectordb = Chroma.from_texts(
-        texts=all_chunks,
-        embedding=embeddings,
-        persist_directory=persist_directory
-    )
-    vectordb.persist()
+    vectordb = FAISS.from_texts(texts=all_chunks, embedding=embeddings)
+    os.makedirs(persist_directory, exist_ok=True)
+    vectordb.save_local(persist_directory)
     return vectordb
 
-def get_retriever(persist_directory="./chroma_db", k=3):
+def get_retriever(persist_directory="./faiss_db", k=3):
     embeddings = OllamaEmbeddings(model="nomic-embed-text")
-    vectordb = Chroma(persist_directory=persist_directory, embedding_function=embeddings)
+    vectordb = FAISS.load_local(
+        persist_directory,
+        embeddings,
+        allow_dangerous_deserialization=True
+    )
     return vectordb.as_retriever(search_kwargs={"k": k})
 
 def create_qa_chain(retriever):
-    llm = OllamaLLM(model="deepseek-r1:7b", temperature=0.1)
-    
+    llm = OllamaLLM(model="qwen2:0.5b", temperature=0.1)
+
     memory = ConversationBufferMemory(
         memory_key="chat_history",
         return_messages=True
     )
-    
+
     template = """基于提供的参考文档回答问题。
 请严格按照文档内容进行回答，不要添加任何外部知识。
 如果文档中没有相关信息，请明确说"文档中未找到相关答案"。
@@ -109,21 +110,24 @@ def create_qa_chain(retriever):
 问题：{question}
 
 回答："""
-    
+
     prompt = PromptTemplate(
         template=template,
         input_variables=["context", "question"]
     )
-    
+
     qa_chain = ConversationalRetrievalChain.from_llm(
         llm=llm,
         retriever=retriever,
         memory=memory,
         combine_docs_chain_kwargs={"prompt": prompt}
     )
-    
+
     return qa_chain
 
 def query_qa_chain(qa_chain, question):
-    result = qa_chain({"question": question})
-    return result.get("answer", "文档中未找到相关答案")
+    try:
+        result = qa_chain.invoke({"question": question})
+        return result.get("answer", "文档中未找到相关答案")
+    except Exception as e:
+        return f"查询失败: {e}"
